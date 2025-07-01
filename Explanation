@@ -1,0 +1,141 @@
+Step-by-Step Explanation of the Financial Fraud Detection Code
+This project aims to predict fraudulent loan applications by analyzing customer loan data and transaction history. Below is a breakdown of the key steps:
+
+1. Data Loading & Initial Exploration
+✅ Load Datasets:
+
+loan_applications.csv (loan details + fraud_flag)
+
+transactions.csv (customer transactions + fraud_flag)
+
+✅ Basic Checks:
+
+.info() → Check missing values & data types
+
+.nunique() → Unique values per column
+
+Convert application_date & transaction_date to datetime
+
+✅ Handle Missing Data:
+
+Fill missing fraud_type with "Not Fraudulent"
+
+2. Data Cleaning & Feature Engineering
+A. Outlier Handling (Numerical Columns)
+📌 Identify Numerical Columns:
+
+loan_amount_requested, monthly_income, etc.
+
+📌 Cap Outliers:
+
+Clip values between 1st & 99th percentiles to reduce skewness.
+
+📌 Visualization:
+
+Before & after box plots to verify outlier treatment.
+
+B. Feature Engineering
+🔹 Time-Based Features:
+
+application_year, application_month, application_day_of_week
+
+🔹 Financial Ratios:
+
+debt_to_income_ratio
+
+loan_amount_to_income_ratio
+
+🔹 Merge Loan & Transaction Data:
+
+Join on customer_id to link loan applications with past transactions.
+
+🔹 Aggregate Transaction Features:
+
+For each loan application, compute:
+
+Number of transactions (30d, 90d, 180d, 365d)
+
+Total transaction amount
+
+Average transaction amount
+
+Unique merchant categories
+
+3. Data Preprocessing
+A. Train-Test Split (Stratified Sampling)
+📌 Target: fraud_flag (binary classification)
+📌 Split: 80% train, 20% test (stratified to maintain fraud ratio)
+
+B. Feature Scaling & Encoding
+🔹 Numerical Features: Standardized using StandardScaler()
+🔹 Categorical Features: One-hot encoded (OneHotEncoder)
+
+C. Handling Class Imbalance (SMOTE)
+📌 Problem: Fraud cases are rare (~1-2%) → Model may ignore fraud.
+📌 Solution: Use SMOTE (Synthetic Minority Oversampling) to balance classes.
+
+4. Model Training & Evaluation
+A. Models Used
+Logistic Regression (Baseline)
+
+Random Forest (Feature Importance)
+
+LightGBM (Best for Imbalanced Data)
+
+B. Evaluation Metrics
+📌 ROC-AUC Score (Measures model’s ability to distinguish fraud vs. non-fraud)
+📌 Classification Report (Precision, Recall, F1-Score)
+📌 Confusion Matrix (TP, TN, FP, FN)
+
+C. Results Interpretation
+LightGBM typically performs best due to handling imbalanced data well.
+
+High Recall → Catch more fraud (even if some false positives).
+
+High Precision → Fewer false alarms.
+
+5. Loan Status Prediction (Multi-Class)
+✅ Target: loan_status (Approved, Declined, Fraudulent)
+✅ Handling Imbalance: SMOTE for multi-class
+✅ Model: LightGBM (Multi-Class Mode)
+✅ Evaluation:
+
+Classification Report
+
+Confusion Matrix
+
+6. Prediction on New Data
+🔹 Function: predict_loan_risk_and_fraud()
+
+Takes new loan application data.
+
+Applies the same preprocessing & feature engineering.
+
+Predicts:
+
+Fraud Probability (Logistic Regression)
+
+Loan Status (LightGBM)
+
+🔹 Example Output:
+
+python
+Predicted Fraud Flag: 1 (Fraud)  
+Fraud Probability: 0.92  
+Predicted Loan Status: "Fraudulent"  
+7. Business Impact & Recommendations
+🚀 Key Benefits:
+✔ Reduce fraud losses by flagging high-risk applications.
+✔ Improve approval accuracy by detecting fraud early.
+✔ Automate risk assessment using ML instead of manual reviews.
+
+📌 Next Steps:
+
+Deploy as a real-time fraud detection API.
+
+Monitor model drift & retrain periodically.
+
+Add geospatial features (e.g., transaction locations).
+
+Final Thoughts
+This project demonstrates a complete fraud detection pipeline, from EDA → Feature Engineering → ML Modeling → Prediction. The LightGBM + SMOTE approach works best for imbalanced fraud detection.
