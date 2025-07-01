@@ -1,1 +1,363 @@
+import warnings
+warnings.simplefilter('ignore')
+
+import pandas as pd
+import numpy as np
+
+import matplotlib.pyplot as plt
+from datetime import timedelta
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+---------------------------------
+loan_applications_df = pd.read_csv('/kaggle/input/loan-application-and-transaction-fraud-detection/loan_applications.csv')
+transactions_df = pd.read_csv('/kaggle/input/loan-application-and-transaction-fraud-detection/transactions.csv')
+
+display(loan_applications_df.head())
+display(transactions_df.head())
+--------------------------------
+print("Loan Applications DataFrame Info:")
+loan_applications_df.info()
+print("\nTransactions DataFrame Info:")
+transactions_df.info()
+
+print("\nLoan Applications DataFrame Unique Value Counts:")
+print(loan_applications_df.nunique())
+print("\nTransactions DataFrame Unique Value Counts:")
+print(transactions_df.nunique())
+
+# Convert date columns to datetime
+loan_applications_df['application_date'] = pd.to_datetime(loan_applications_df['application_date'])
+transactions_df['transaction_date'] = pd.to_datetime(transactions_df['transaction_date'])
+
+loan_applications_df['fraud_type'].fillna('Not Fraudulent', inplace=True)
+
+# value counts for fraud_type
+print("\nValue counts for 'fraud_type' after handling missing values:")
+print(loan_applications_df['fraud_type'].value_counts())
+---------------------------------------
+# Identify numerical columns
+numerical_cols = loan_applications_df.select_dtypes(include=np.number).columns.tolist()
+print(f"Numerical columns: {numerical_cols}")
+
+print("Initial Box plots for numerical features:")
+fig, axes = plt.subplots(nrows=len(numerical_cols), figsize=(10, 5 * len(numerical_cols)))
+for i, col in enumerate(numerical_cols):
+    axes[i].boxplot(loan_applications_df[col].dropna())
+    axes[i].set_title(f'Box plot of {col}')
+    axes[i].set_ylabel(col)
+plt.tight_layout()
+plt.show()
+
+# Cap outliers using 1st and 99th percentiles
+print("Capping outliers at 1st and 99th percentiles...")
+for col in numerical_cols:
+    lower_bound = loan_applications_df[col].quantile(0.01)
+    upper_bound = loan_applications_df[col].quantile(0.99)
+    loan_applications_df[col] = loan_applications_df[col].clip(lower=lower_bound, upper=upper_bound)
+
+# after capping outliers
+print("Box plots for numerical features after capping outliers:")
+fig, axes = plt.subplots(nrows=len(numerical_cols), figsize=(10, 5 * len(numerical_cols)))
+for i, col in enumerate(numerical_cols):
+    axes[i].boxplot(loan_applications_df[col].dropna())
+    axes[i].set_title(f'Box plot of {col} (After Capping)')
+    axes[i].set_ylabel(col)
+plt.tight_layout()
+plt.show()
+--------------------------------------------------
+# 1. time-based features from application_date
+loan_applications_df['application_year'] = loan_applications_df['application_date'].dt.year
+loan_applications_df['application_month'] = loan_applications_df['application_date'].dt.month
+loan_applications_df['application_day_of_week'] = loan_applications_df['application_date'].dt.dayofweek # Monday=0, Sunday=6
+
+# 2. debt-to-income ratio 
+epsilon = 1e-6
+loan_applications_df['debt_to_income_ratio_recalculated'] = (loan_applications_df['existing_emis_monthly'] / (loan_applications_df['monthly_income'] + epsilon)) * 100
+
+# 3. loan amount to monthly income ratio
+loan_applications_df['loan_amount_to_income_ratio'] = (loan_applications_df['loan_amount_requested'] / (loan_applications_df['monthly_income'] + epsilon)) * 100
+
+# 4. existing EMI to monthly income ratio 
+loan_applications_df.rename(columns={'debt_to_income_ratio_recalculated': 'existing_emi_to_income_ratio'}, inplace=True)
+
+merged_df = pd.merge(loan_applications_df, transactions_df, on='customer_id', how='left')
+
+display(loan_applications_df[['application_date', 'application_year', 'application_month', 'application_day_of_week',
+                              'existing_emi_to_income_ratio', 'loan_amount_to_income_ratio']].head())
+-------------------
+# Define time windows in days
+time_windows = [30, 90, 180, 365]
+
+aggregated_transaction_features = []
+
+merged_df = merged_df.sort_values(by=['customer_id', 'transaction_date'])
+
+for customer_id, customer_group in merged_df.groupby('customer_id'):
+    for index, loan_row in customer_group.drop_duplicates(subset='application_id').iterrows(): 
+        application_date = loan_row['application_date']
+        application_id = loan_row['application_id']
+
+        transactions_before_application = customer_group[
+            customer_group['transaction_date'] < application_date
+        ].copy() 
+
+        app_features = {'application_id': application_id}
+
+        for window_days in time_windows:
+            window_start_date = application_date - timedelta(days=window_days)
+
+            transactions_in_window = transactions_before_application[
+                transactions_before_application['transaction_date'] >= window_start_date
+            ]
+
+            num_transactions = transactions_in_window.shape[0]
+            total_transaction_amount = transactions_in_window['transaction_amount'].sum()
+            average_transaction_amount = transactions_in_window['transaction_amount'].mean()
+            unique_merchant_categories = transactions_in_window['merchant_category'].nunique()
+
+            app_features[f'num_transactions_{window_days}d'] = num_transactions
+            app_features[f'total_transaction_amount_{window_days}d'] = total_transaction_amount
+            app_features[f'average_transaction_amount_{window_days}d'] = average_transaction_amount if num_transactions > 0 else 0
+            app_features[f'unique_merchant_categories_{window_days}d'] = unique_merchant_categories
+
+        aggregated_transaction_features.append(app_features)
+
+transaction_aggregation_df = pd.DataFrame(aggregated_transaction_features)
+
+loan_applications_df = pd.merge(loan_applications_df, transaction_aggregation_df, on='application_id', how='left')
+
+display(transaction_aggregation_df.head())
+display(loan_applications_df.head())
+------------------------------
+# 1. Define target variables
+y_fraud = loan_applications_df['fraud_flag']
+y_loan_status = loan_applications_df['loan_status']
+
+# 2. Define the feature set X by dropping irrelevant columns
+X = loan_applications_df.drop(columns=['fraud_flag', 'loan_status', 'fraud_type', 'application_id', 'customer_id', 'application_date'])
+
+# 3. Identify numerical and categorical features
+numerical_features = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+categorical_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+print(f"Numerical features: {numerical_features}")
+print(f"Categorical features: {categorical_features}")
+
+# 4. Create a ColumnTransformer
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numerical_features),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    ],
+    remainder='passthrough' # Keep other columns that are not transformed
+)
+
+# 5. Fit and transform the feature set X
+X_processed = preprocessor.fit_transform(X)
+
+print("\nShape of original features X:", X.shape)
+print("Shape of processed features X_processed:", X_processed.shape)
+------------------------------------------------
+# 1. Split the processed data and the target variable
+X_train, X_test, y_train, y_test = train_test_split(X_processed, y_fraud, test_size=0.2, random_state=42, stratify=y_fraud)
+
+print("Shape of original training data:", X_train.shape)
+print("Shape of original testing data:", X_test.shape)
+print("Distribution of fraud_flag in training data:\n", y_train.value_counts())
+print("Distribution of fraud_flag in testing data:\n", y_test.value_counts())
+
+# 2. class imbalance using SMOTE on the training data
+smote = SMOTE(random_state=42)
+X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+
+print("\nShape of SMOTE-augmented training data:", X_train_smote.shape)
+print("Distribution of fraud_flag in SMOTE-augmented training data:\n", y_train_smote.value_counts())
+
+
+# 3. Initialize and train a Logistic Regression model
+print("\nTraining Logistic Regression model...")
+lr_model = LogisticRegression(max_iter=1000, random_state=42)
+lr_model.fit(X_train_smote, y_train_smote)
+
+# 4. Initialize and train a Random Forest Classifier model
+print("Training Random Forest Classifier model...")
+rf_model = RandomForestClassifier(random_state=42)
+rf_model.fit(X_train_smote, y_train_smote)
+
+# 5. Initialize and train a LightGBM Classifier model
+print("Training LightGBM Classifier model...")
+lgbm_model = LGBMClassifier(random_state=42)
+lgbm_model.fit(X_train_smote, y_train_smote)
+
+# 6. Evaluate each trained model on the test set
+models = {
+    "Logistic Regression": lr_model,
+    "Random Forest": rf_model,
+    "LightGBM": lgbm_model
+}
+
+print("\nEvaluating models on the test set:")
+for name, model in models.items():
+    print(f"\n--- {name} ---")
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    print(f"ROC AUC: {roc_auc:.4f}")
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+--------------------------------------
+X_train_loan_status, X_test_loan_status, y_train_loan_status, y_test_loan_status = train_test_split(
+    X_processed, y_loan_status, test_size=0.2, random_state=42, stratify=y_loan_status
+)
+
+print("Shape of original training data (loan status):", X_train_loan_status.shape)
+print("Shape of original testing data (loan status):", X_test_loan_status.shape)
+print("Distribution of loan_status in training data:\n", y_train_loan_status.value_counts())
+print("Distribution of loan_status in testing data:\n", y_test_loan_status.value_counts())
+
+smote_loan_status = SMOTE(random_state=42)
+X_train_loan_status_smote, y_train_loan_status_smote = smote_loan_status.fit_resample(
+    X_train_loan_status, y_train_loan_status
+)
+
+print("\nShape of SMOTE-augmented training data (loan status):", X_train_loan_status_smote.shape)
+print("Distribution of loan_status in SMOTE-augmented training data:\n", y_train_loan_status_smote.value_counts())
+
+print("\nTraining LightGBM Classifier model for loan status...")
+lgbm_loan_status_model = LGBMClassifier(objective='multiclass', num_class=y_train_loan_status.nunique(), random_state=42)
+lgbm_loan_status_model.fit(X_train_loan_status_smote, y_train_loan_status_smote)
+
+print("\nEvaluating LightGBM model for loan status on the test set:")
+y_pred_loan_status = lgbm_loan_status_model.predict(X_test_loan_status)
+
+print("\nClassification Report (Loan Status):")
+print(classification_report(y_test_loan_status, y_pred_loan_status))
+
+print("Confusion Matrix (Loan Status):")
+print(confusion_matrix(y_test_loan_status, y_pred_loan_status))
+-------------------------------------------
+# 1. new target variable by combining fraudulent classes
+y_loan_status_combined = y_loan_status.replace(['Fraudulent - Detected', 'Fraudulent - Undetected'], 'Fraudulent')
+
+print("Distribution of combined loan_status:\n", y_loan_status_combined.value_counts())
+
+# 2. Split the processed feature data and the new combined target variable
+X_train_loan_status_combined, X_test_loan_status_combined, y_train_loan_status_combined, y_test_loan_status_combined = train_test_split(
+    X_processed, y_loan_status_combined, test_size=0.2, random_state=42, stratify=y_loan_status_combined
+)
+
+print("\nShape of original training data (combined loan status):", X_train_loan_status_combined.shape)
+print("Shape of original testing data (combined loan status):", X_test_loan_status_combined.shape)
+print("Distribution of combined loan_status in training data:\n", y_train_loan_status_combined.value_counts())
+print("Distribution of combined loan_status in testing data:\n", y_test_loan_status_combined.value_counts())
+
+smote_loan_status_combined = SMOTE(random_state=42)
+X_train_loan_status_combined_smote, y_train_loan_status_combined_smote = smote_loan_status_combined.fit_resample(
+    X_train_loan_status_combined, y_train_loan_status_combined
+)
+
+print("\nShape of SMOTE-augmented training data (combined loan status):", X_train_loan_status_combined_smote.shape)
+print("Distribution of combined loan_status in SMOTE-augmented training data:\n", y_train_loan_status_combined_smote.value_counts())
+
+print("\nTraining LightGBM Classifier model for combined loan status...")
+lgbm_loan_status_combined_model = LGBMClassifier(
+    objective='multiclass',
+    num_class=y_train_loan_status_combined_smote.nunique(),
+    random_state=42
+)
+lgbm_loan_status_combined_model.fit(X_train_loan_status_combined_smote, y_train_loan_status_combined_smote)
+
+print("\nEvaluating LightGBM model for combined loan status on the test set:")
+y_pred_loan_status_combined = lgbm_loan_status_combined_model.predict(X_test_loan_status_combined)
+
+print("\nClassification Report (Combined Loan Status):")
+print(classification_report(y_test_loan_status_combined, y_pred_loan_status_combined))
+
+print("Confusion Matrix (Combined Loan Status):")
+print(confusion_matrix(y_test_loan_status_combined, y_pred_loan_status_combined))
+-------------------------------------------------
+def predict_loan_risk_and_fraud(new_application_data, preprocessor, lr_model, lgbm_loan_status_combined_model):
+    new_application_df = pd.DataFrame([new_application_data])
+
+    new_application_df['application_date'] = pd.to_datetime(new_application_df['application_date'])
+
+    new_application_df['application_year'] = new_application_df['application_date'].dt.year
+    new_application_df['application_month'] = new_application_df['application_date'].dt.month
+    new_application_df['application_day_of_week'] = new_application_df['application_date'].dt.dayofweek
+
+    epsilon = 1e-6
+    new_application_df['existing_emi_to_income_ratio'] = (new_application_df['existing_emis_monthly'] / (new_application_df['monthly_income'] + epsilon)) * 100
+    new_application_df['loan_amount_to_income_ratio'] = (new_application_df['loan_amount_requested'] / (new_application_df['monthly_income'] + epsilon)) * 100
+
+    time_windows = [30, 90, 180, 365]
+    for window_days in time_windows:
+        new_application_df[f'num_transactions_{window_days}d'] = 0
+        new_application_df[f'total_transaction_amount_{window_days}d'] = 0.0
+        new_application_df[f'average_transaction_amount_{window_days}d'] = 0.0
+        new_application_df[f'unique_merchant_categories_{window_days}d'] = 0
+
+    X_columns = X.columns.tolist()
+
+    new_application_processed_data = {}
+    for col in X_columns:
+        if col in new_application_df.columns:
+            new_application_processed_data[col] = new_application_df[col].iloc[0]
+
+    new_application_processed_df = pd.DataFrame([new_application_processed_data])
+
+    new_application_processed_scaled = preprocessor.transform(new_application_processed_df)
+
+
+    fraud_prediction = lr_model.predict(new_application_processed_scaled)[0]
+    fraud_prediction_proba = lr_model.predict_proba(new_application_processed_scaled)[:, 1][0]
+
+    loan_status_prediction = lgbm_loan_status_combined_model.predict(new_application_processed_scaled)[0]
+    loan_status_prediction_proba = lgbm_loan_status_combined_model.predict_proba(new_application_processed_scaled)
+
+    return fraud_prediction, fraud_prediction_proba, loan_status_prediction, loan_status_prediction_proba
+
+# Example Hypothetical New Application Data
+hypothetical_application = {
+    'application_date': '2025-01-15',
+    'loan_type': 'Personal Loan',
+    'loan_amount_requested': 500000.0,
+    'loan_tenure_months': 60,
+    'interest_rate_offered': 12.5,
+    'purpose_of_loan': 'Debt Consolidation',
+    'employment_status': 'Salaried',
+    'monthly_income': 70000.0,
+    'cibil_score': 750,
+    'existing_emis_monthly': 10000.0,
+    'debt_to_income_ratio': 14.28,
+    'property_ownership_status': 'Rented',
+    'residential_address': 'Some Address', 
+    'applicant_age': 35,
+    'gender': 'Male',
+    'number_of_dependents': 2,
+}
+
+# Make predictions
+predicted_fraud_flag, fraud_proba, predicted_loan_status, loan_status_proba = predict_loan_risk_and_fraud(
+    hypothetical_application,
+    preprocessor,
+    lr_model,
+    lgbm_loan_status_combined_model
+)
+
+print(f"\nHypothetical Application Details:\n{hypothetical_application}")
+print(f"\nPredicted Fraud Flag (0: Not Fraud, 1: Fraud): {predicted_fraud_flag}")
+print(f"Predicted Fraud Probability: {fraud_proba:.4f}")
+print(f"Predicted Loan Status: {predicted_loan_status}")
+print("Predicted Loan Status Probabilities (Approved, Declined, Fraudulent):", loan_status_proba)
+--------------------------------------------------
 
